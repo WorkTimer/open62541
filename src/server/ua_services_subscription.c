@@ -159,11 +159,7 @@ static UA_StatusCode
 setMonitoredItemSettings(UA_Server *server, UA_MonitoredItem *mon,
                          UA_MonitoringMode monitoringMode,
                          const UA_MonitoringParameters *params,
-                         // This parameter is optional and used only if mon->lastValue is not set yet.
-                         // Then numeric type will be detected from this value. Set null as defaut.
                          const UA_DataType* dataType) {
-
-
     /* Filter */
     if(params->filter.encoding != UA_EXTENSIONOBJECT_DECODED) {
         UA_DataChangeFilter_init(&(mon->filter.dataChangeFilter));
@@ -171,17 +167,11 @@ setMonitoredItemSettings(UA_Server *server, UA_MonitoredItem *mon,
     } else if(params->filter.content.decoded.type == &UA_TYPES[UA_TYPES_DATACHANGEFILTER]) {
         UA_DataChangeFilter *filter = (UA_DataChangeFilter *)params->filter.content.decoded.data;
         // TODO implement EURange to support UA_DEADBANDTYPE_PERCENT
-        if (filter->deadbandType == UA_DEADBANDTYPE_PERCENT) {
+        if(filter->deadbandType == UA_DEADBANDTYPE_PERCENT)
             return UA_STATUSCODE_BADMONITOREDITEMFILTERUNSUPPORTED;
-        }
-        if (UA_Variant_isEmpty(&mon->lastValue)) {
-            if (!dataType || !isDataTypeNumeric(dataType))
-                return UA_STATUSCODE_BADFILTERNOTALLOWED;
-        } else
-        if (!isDataTypeNumeric(mon->lastValue.type)) {
+        if(!dataType || !isDataTypeNumeric(dataType))
             return UA_STATUSCODE_BADFILTERNOTALLOWED;
-        }
-        UA_DataChangeFilter_copy(filter, &(mon->filter.dataChangeFilter));
+        UA_DataChangeFilter_copy(filter, &mon->filter.dataChangeFilter);
 #ifdef UA_ENABLE_SUBSCRIPTIONS_EVENTS
     } else if (params->filter.content.decoded.type == &UA_TYPES[UA_TYPES_EVENTFILTER]) {
         UA_EventFilter_copy((UA_EventFilter *)params->filter.content.decoded.data,
@@ -439,7 +429,8 @@ Operation_ModifyMonitoredItem(UA_Server *server, UA_Session *session, UA_Subscri
         return;
     }
     UA_StatusCode retval;
-    retval = setMonitoredItemSettings(server, mon, mon->monitoringMode, &request->requestedParameters, NULL);
+    retval = setMonitoredItemSettings(server, mon, mon->monitoringMode,
+                                      &request->requestedParameters, NULL);
     if(retval != UA_STATUSCODE_GOOD) {
         result->statusCode = retval;
         return;
@@ -531,7 +522,6 @@ Operation_SetMonitoringMode(UA_Server *server, UA_Session *session,
 
         /* Initialize lastSampledValue */
         UA_ByteString_deleteMembers(&mon->lastSampledValue);
-        UA_Variant_deleteMembers(&mon->lastValue);
     }
 }
 

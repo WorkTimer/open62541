@@ -66,52 +66,54 @@ outOfDeadBand(const void *data1, const void *data2, const size_t index,
     return true;
 }
 
-static UA_INLINE UA_Boolean
-updateNeededForFilteredValue(const UA_Variant *value, const UA_Variant *oldValue,
-                             const UA_Double deadbandValue) {
-    if(value->arrayLength != oldValue->arrayLength)
+static UA_Boolean
+updateNeededForFilteredValue(UA_Server *server, const UA_ByteString *lastSampledValue,
+                             const UA_Variant *value, const UA_Double deadbandValue) {
+    /* Decode old value */
+    UA_DataValue lastValue;
+    UA_DataValue_init(&lastValue);
+    size_t offset = 0;
+    UA_StatusCode retval = UA_decodeBinary(lastSampledValue, &offset, &lastValue,
+                                           &UA_TYPES[UA_TYPES_DATAVALUE],
+                                           server->config.customDataTypesSize,
+                                           server->config.customDataTypes);
+    if(retval != UA_STATUSCODE_GOOD)
         return true;
 
-    if(value->type != oldValue->type)
-        return true;
+    UA_Boolean changed = true;
+    if(value->arrayLength != lastValue.value.arrayLength)
+        goto cleanup;
 
-    if (UA_Variant_isScalar(value)) {
-        return outOfDeadBand(value->data, oldValue->data, 0, value->type, deadbandValue);
+    if(value->type != lastValue.value.type)
+        goto cleanup;
+
+    if(UA_Variant_isScalar(value)) {
+        changed = outOfDeadBand(value->data, lastValue.value.data, 0, value->type, deadbandValue);
     } else {
-        for (size_t i = 0; i < value->arrayLength; ++i) {
-            if (outOfDeadBand(value->data, oldValue->data, i, value->type, deadbandValue))
-                return true;
+        changed = false;
+        for(size_t i = 0; i < value->arrayLength; ++i) {
+            if(outOfDeadBand(value->data, lastValue.value.data, i, value->type, deadbandValue)) {
+                changed = true;
+                goto cleanup;
+            }
         }
     }
-    return false;
+
+ cleanup:
+    UA_DataValue_deleteMembers(&lastValue);
+    return changed;
 }
 
 /* When a change is detected, encoding contains the heap-allocated binary encoded value */
 static UA_Boolean
-detectValueChangeWithFilter(UA_Server *server, UA_MonitoredItem *mon, UA_DataValue *value,
-                            UA_ByteString *encoding) {
+detectValueChangeWithFilter(UA_Server *server, UA_MonitoredItem *mon,
+                            const UA_DataValue *value, UA_ByteString *encoding) {
     UA_Session *session = &server->adminSession;
     UA_UInt32 subscriptionId = 0;
     UA_Subscription *sub = mon->subscription;
     if(sub) {
         session = sub->session;
         subscriptionId = sub->subscriptionId;
-    }
-
-    if(isDataTypeNumeric(value->value.type) &&
-       (mon->filter.dataChangeFilter.trigger == UA_DATACHANGETRIGGER_STATUSVALUE ||
-        mon->filter.dataChangeFilter.trigger == UA_DATACHANGETRIGGER_STATUSVALUETIMESTAMP)) {
-        if(mon->filter.dataChangeFilter.deadbandType == UA_DEADBANDTYPE_ABSOLUTE) {
-            if(!updateNeededForFilteredValue(&value->value, &mon->lastValue,
-                                             mon->filter.dataChangeFilter.deadbandValue))
-                return false;
-        }
-        /* else if (mon->filter.deadbandType == UA_DEADBANDTYPE_PERCENT) {
-            // TODO where do this EURange come from ?
-            UA_Double deadbandValue = fabs(mon->filter.deadbandValue * (EURange.high-EURange.low));
-            if (!updateNeededForFilteredValue(value->value, mon->lastValue, deadbandValue))
-                return false;
-        }*/
     }
 
     /* Stack-allocate some memory for the value encoding. We might heap-allocate
@@ -127,7 +129,9 @@ detectValueChangeWithFilter(UA_Server *server, UA_MonitoredItem *mon, UA_DataVal
     const UA_Byte *bufEnd = &valueEncoding.data[valueEncoding.length];
     UA_StatusCode retval = UA_encodeBinary(value, &UA_TYPES[UA_TYPES_DATAVALUE],
                                            &bufPos, &bufEnd, NULL, NULL);
-    if(retval == UA_STATUSCODE_BADENCODINGERROR) {
+
+    /* Encoding failed. Allocate more memory and try again. */
+    if(retval != UA_STATUSCODE_GOOD) {
         size_t binsize = UA_calcSizeBinary(value, &UA_TYPES[UA_TYPES_DATAVALUE]);
         if(binsize == 0)
             return false;
@@ -141,26 +145,46 @@ detectValueChangeWithFilter(UA_Server *server, UA_MonitoredItem *mon, UA_DataVal
                                          &bufPos, &bufEnd, NULL, NULL);
             }
         }
+
+        if(retval != UA_STATUSCODE_GOOD) {
+            UA_LOG_WARNING_SESSION(server->config.logger, session,
+                                   "Subscription %u | MonitoredItem %i | "
+                                   "Could not encode the value the MonitoredItem with status %s",
+                                   subscriptionId, mon->monitoredItemId, UA_StatusCode_name(retval));
+            return false;
+        }
     }
 
-    if(retval != UA_STATUSCODE_GOOD) {
-        UA_LOG_WARNING_SESSION(server->config.logger, session,
-                               "Subscription %u | MonitoredItem %i | "
-                               "Could not encode the value the MonitoredItem with status %s",
-                               subscriptionId, mon->monitoredItemId, UA_StatusCode_name(retval));
-        return false;
-    }
-
-    /* Has the value changed? */
     valueEncoding.length = (uintptr_t)bufPos - (uintptr_t)valueEncoding.data;
+
+    /* Test if the encoding differs */
     UA_Boolean changed = (!mon->lastSampledValue.data ||
                           !UA_String_equal(&valueEncoding, &mon->lastSampledValue));
-
-    /* No change */
     if(!changed) {
         if(valueEncoding.data != stackValueEncoding)
             UA_ByteString_deleteMembers(&valueEncoding);
         return false;
+    }
+
+    /* Test for Deadband if the filter is configured */
+    if(isDataTypeNumeric(value->value.type) && mon->lastSampledValue.length > 0 &&
+       (mon->filter.dataChangeFilter.trigger == UA_DATACHANGETRIGGER_STATUSVALUE ||
+        mon->filter.dataChangeFilter.trigger == UA_DATACHANGETRIGGER_STATUSVALUETIMESTAMP)) {
+        if(mon->filter.dataChangeFilter.deadbandType == UA_DEADBANDTYPE_ABSOLUTE) {
+            changed = updateNeededForFilteredValue(server, &mon->lastSampledValue, &value->value,
+                                                   mon->filter.dataChangeFilter.deadbandValue);
+        }
+        /* else if(mon->filter.deadbandType == UA_DEADBANDTYPE_PERCENT) {
+            // TODO where do this EURange come from ?
+            UA_Double deadbandValue = fabs(mon->filter.deadbandValue * (EURange.high-EURange.low));
+            changed = updateNeededForFilteredValue(server, mon->lastSampledValue, &value->value, deadbandValue);
+        }*/
+
+        if(!changed) {
+            if(valueEncoding.data != stackValueEncoding)
+                UA_ByteString_deleteMembers(&valueEncoding);
+            return false;
+        }
     }
 
     /* Change detected. Copy encoding on the heap if necessary. */
@@ -201,7 +225,6 @@ detectValueChange(UA_Server *server, UA_MonitoredItem *mon,
     return detectValueChangeWithFilter(server, mon, &value, encoding);
 }
 
-/* Returns whether the sample was stored in the MonitoredItem */
 static UA_Boolean
 sampleCallbackWithValue(UA_Server *server, UA_MonitoredItem *monitoredItem,
                         UA_DataValue *value) {
@@ -218,6 +241,7 @@ sampleCallbackWithValue(UA_Server *server, UA_MonitoredItem *monitoredItem,
         return false;
 
     UA_Boolean storedValue = false;
+
     if(sub) {
         /* Allocate a new notification */
         UA_Notification *newNotification = (UA_Notification *)UA_malloc(sizeof(UA_Notification));
@@ -272,9 +296,6 @@ sampleCallbackWithValue(UA_Server *server, UA_MonitoredItem *monitoredItem,
     /* Store the encoding for comparison */
     UA_ByteString_deleteMembers(&monitoredItem->lastSampledValue);
     monitoredItem->lastSampledValue = binaryEncoding;
-    UA_Variant_deleteMembers(&monitoredItem->lastValue);
-    UA_Variant_copy(&value->value, &monitoredItem->lastValue);
-
     return storedValue;
 }
 
@@ -306,8 +327,6 @@ UA_MonitoredItem_sampleCallback(UA_Server *server, UA_MonitoredItem *monitoredIt
 
     /* Operate on the sample */
     UA_Boolean storedValue = sampleCallbackWithValue(server, monitoredItem, &value);
-
-    /* Delete the sample if it was not stored in the MonitoredItem  */
     if(!storedValue)
         UA_DataValue_deleteMembers(&value);
 }

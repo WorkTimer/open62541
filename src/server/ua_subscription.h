@@ -105,7 +105,6 @@ struct UA_MonitoredItem {
 #endif
         UA_DataChangeFilter dataChangeFilter;
     } filter;
-    UA_Variant lastValue;
 
     /* Sample Callback */
     UA_UInt64 sampleCallbackId;
